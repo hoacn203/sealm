@@ -158,7 +158,7 @@ def go_to_boss(emulator, boss_number: int) -> None:
     emulator.tap(boss_positions[boss_number])
     time.sleep(0.3)
     emulator.tap((1447, 833))
-    time.sleep(1)
+    time.sleep(1)  
     emulator.tap((939, 677))
 
 
