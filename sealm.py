@@ -217,12 +217,13 @@ def go_to_boss(emulator, boss_number: int) -> None:
 # 2. Thử tối đa 2 lượt danh sách:
 #    - Lượt 1 kéo xuống.
 #    - Lượt 2 kéo ngược lên.
-# 3. Boss 1 và 2 giữ logic cũ: ưu tiên icon thứ 2, nhưng nếu lượt 1 chỉ có 1 icon thì sang lượt 2 sẽ ưu tiên icon đầu tiên.
-# 4. Boss 3 và 4 ưu tiên click icon đầu tiên ngay khi thấy.
-# 5. Sau mỗi lần click icon boss, luôn đợi 1 giây rồi chụp lại màn hình:
+# 3. Mỗi lượt sẽ tạo danh sách ứng viên click theo rule của từng boss.
+# 4. Boss 1 và 2 ưu tiên icon thứ 2; nếu lượt 1 chỉ có 1 icon thì sang lượt 2 ưu tiên icon đầu tiên.
+# 5. Boss 3 và 4 ưu tiên icon đầu tiên, sau đó mới thử icon tiếp theo nếu còn.
+# 6. Sau mỗi lần click icon boss, luôn đợi 1 giây rồi chụp lại màn hình:
 #    - Nếu không còn icon boss nữa thì coi như vào channel thành công.
-#    - Nếu vẫn còn icon boss thì tiếp tục logic chọn tiếp trong cùng lượt hoặc sang lượt sau.
-# 6. Nếu sau cả 2 lượt vẫn không chọn được thì return skip.
+#    - Nếu vẫn còn icon boss thì thử ứng viên tiếp theo trong cùng lượt trước khi sang lượt sau.
+# 7. Nếu sau cả 2 lượt vẫn không chọn được thì return skip.
 def select_channel_boss(emulator, boss_number: int, threshold: float = 0.8) -> dict:
     if boss_number not in BOSS_ICON_TEMPLATES:
         print("Ko có template")
@@ -271,58 +272,67 @@ def select_channel_boss(emulator, boss_number: int, threshold: float = 0.8) -> d
         if not positions:
             continue
 
-        target: tuple[int, int] | None = None
-        reason: str | None = None
+        candidate_indices: list[int] = []
+        candidate_reasons: list[str] = []
 
         if boss_number in (3, 4):
-            target = positions[0]
-            reason = f"clicked_first_match_scroll_{scroll_index + 1}"
+            candidate_indices.append(0)
+            candidate_reasons.append(f"clicked_first_match_scroll_{scroll_index + 1}")
+            if len(positions) >= 2:
+                candidate_indices.append(1)
+                candidate_reasons.append(f"clicked_second_match_scroll_{scroll_index + 1}")
         else:
             if scroll_index == 0 and len(positions) == 1:
                 first_scroll_single_icon = True
                 continue
 
             if scroll_index == 1 and first_scroll_single_icon:
-                target = positions[0]
-                reason = "clicked_first_match_scroll_2_after_single_match_on_scroll_1"
-            elif len(positions) >= 2:
-                target = positions[1]
-                reason = f"clicked_second_match_scroll_{scroll_index + 1}"
-            elif scroll_index == 1:
-                target = positions[0]
-                reason = "clicked_first_match_scroll_2_fallback"
+                candidate_indices.append(0)
+                candidate_reasons.append("clicked_first_match_scroll_2_after_single_match_on_scroll_1")
+                if len(positions) >= 2:
+                    candidate_indices.append(1)
+                    candidate_reasons.append("clicked_second_match_scroll_2_after_single_match_on_scroll_1")
+            else:
+                if len(positions) >= 2:
+                    candidate_indices.append(1)
+                    candidate_reasons.append(f"clicked_second_match_scroll_{scroll_index + 1}")
+                if scroll_index == 1 and len(positions) >= 1:
+                    candidate_indices.append(0)
+                    candidate_reasons.append("clicked_first_match_scroll_2_fallback")
 
-        if target is None or reason is None:
-            continue
+        for candidate_index, reason in zip(candidate_indices, candidate_reasons):
+            if candidate_index >= len(positions):
+                continue
 
-        emulator.tap(target)
-        time.sleep(1)
+            target = positions[candidate_index]
+            emulator.tap(target)
+            time.sleep(1)
 
-        screen_bytes = emulator._get_screencap_b64decode()
-        if not screen_bytes:
-            return {
-                "success": False,
-                "boss_number": boss_number,
-                "clicked": True,
-                "target": target,
-                "template": str(template_path),
-                "reason": f"capture_failed_after_click_scroll_{scroll_index + 1}: {emulator.error!r}",
-            }
+            screen_bytes = emulator._get_screencap_b64decode()
+            if not screen_bytes:
+                return {
+                    "success": False,
+                    "boss_number": boss_number,
+                    "clicked": True,
+                    "target": target,
+                    "template": str(template_path),
+                    "reason": f"capture_failed_after_click_scroll_{scroll_index + 1}: {emulator.error!r}",
+                }
 
-        screen = decode_screen(screen_bytes)
-        retry_positions = deduplicate_positions(
-            find_template_positions(screen, template, threshold=threshold),
-            template,
-        )
-        if not retry_positions:
-            return {
-                "success": True,
-                "boss_number": boss_number,
-                "clicked": True,
-                "target": target,
-                "template": str(template_path),
-                "reason": f"{reason}_success",
-            }
+            screen = decode_screen(screen_bytes)
+            retry_positions = deduplicate_positions(
+                find_template_positions(screen, template, threshold=threshold),
+                template,
+            )
+            if not retry_positions:
+                return {
+                    "success": True,
+                    "boss_number": boss_number,
+                    "clicked": True,
+                    "target": target,
+                    "template": str(template_path),
+                    "reason": f"{reason}_success",
+                }
 
     print("Không thấy boss")
     return {
