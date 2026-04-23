@@ -97,14 +97,31 @@ class ObjectEmulator:
 
     def _update(self) -> bool:
         cmd = f'{self._controller} list2 | "{self.sed}" -n "/^{self._index},/p"'
-        args = self._run_cmd(cmd).split("\r\n")[0].split(",")
-        if args[2] != "0":
-            self._top_hwnd = int(args[2])
-            self._bind_hwnd = int(args[3])
-            self._android = int(args[4])
-            self._pid = int(args[5])
-            self._pid_vbox = int(args[6])
-            return True
+        raw_output = self._run_cmd(cmd)
+        first_line = raw_output.split("\r\n")[0].strip() if raw_output else ""
+        if not first_line:
+            self._error = f"empty list2 output for index={self._index}"
+            return False
+
+        args = [part.strip() for part in first_line.split(",")]
+        if len(args) < 7:
+            self._error = f"invalid list2 output for index={self._index}: {first_line!r}"
+            return False
+
+        try:
+            if args[2] != "0":
+                self._top_hwnd = int(args[2])
+                self._bind_hwnd = int(args[3])
+                self._android = int(args[4])
+                self._pid = int(args[5])
+                self._pid_vbox = int(args[6])
+                self._error = ""
+                return True
+        except (TypeError, ValueError) as exc:
+            self._error = f"failed to parse list2 output for index={self._index}: {first_line!r} ({exc!r})"
+            return False
+
+        self._error = f"emulator index={self._index} returned zero hwnd: {first_line!r}"
         return False
 
     def wait_to_started(self, timeout: float = 60):

@@ -5,8 +5,11 @@ import multiprocessing
 import queue
 import sys
 import time
+import traceback
 import types
 import tkinter as tk
+import ctypes
+from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -39,6 +42,9 @@ STARTGAME_TEMPLATE = Path("images/startgame.png")
 DISCONNECT_TEMPLATE = Path("images/disconnect.png")
 QUEST_DONE_TEMPLATE = Path("images/quest_done.png")
 CONFIRM_QUEST_TEMPLATE = Path("images/confirm_quest.png")
+CONFIRM_CHANNEL_TEMPLATE = Path("images/confirm_channel.png")
+BACK1_TEMPLATE = Path("images/back1.png")
+BACK2_TEMPLATE = Path("images/back2.png")
 DUNGEON_ENTER_TEMPLATE = Path("images/dungeon_enter.png")
 DUNGEON_INSTANCE_TEMPLATE = Path("images/dungeon_intance.png")
 DUNGEON_LEAVE_TEMPLATE = Path("images/dungeon_leave.png")
@@ -100,6 +106,628 @@ def create_ldplayer():
     return ld, cloned_keys
 
 
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
+MK_LBUTTON = 0x0001
+VK_ESCAPE = 0x1B
+ANDROID_TO_WINDOWS_KEY = {
+    111: VK_ESCAPE,
+}
+PW_RENDERFULLCONTENT = 0x00000002
+SRCCOPY = 0x00CC0020
+DIB_RGB_COLORS = 0
+BI_RGB = 0
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+
+
+def _make_lparam(x: int, y: int) -> int:
+    return ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+
+
+
+def _collect_window_handles(*hwnds: int) -> list[int]:
+    user32 = ctypes.windll.user32
+    collected: list[int] = []
+    seen: set[int] = set()
+
+    def add_hwnd(candidate: int) -> None:
+        if not candidate or candidate in seen:
+            return
+        if not user32.IsWindow(candidate):
+            return
+        seen.add(candidate)
+        collected.append(candidate)
+
+    for hwnd in hwnds:
+        add_hwnd(hwnd)
+
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def callback(child_hwnd, _lparam):
+        add_hwnd(int(child_hwnd))
+        return True
+
+    callback_fn = enum_proc(callback)
+    for hwnd in list(collected):
+        user32.EnumChildWindows(hwnd, callback_fn, 0)
+
+    return collected
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("union", INPUT_UNION),
+    ]
+
+
+
+def focus_window_for_input(hwnd: int) -> dict:
+    user32 = ctypes.windll.user32
+    if not hwnd or not user32.IsWindow(hwnd):
+        return {
+            "ok": False,
+            "reason": "window_not_found",
+            "hwnd": hwnd,
+        }
+
+    placement_result = user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+    show_result = user32.ShowWindow(hwnd, 5)
+    foreground_result = user32.SetForegroundWindow(hwnd)
+    active_result = user32.SetActiveWindow(hwnd)
+    focus_result = user32.SetFocus(hwnd)
+
+    return {
+        "ok": bool(foreground_result or active_result or focus_result),
+        "reason": "focused" if (foreground_result or active_result or focus_result) else "focus_failed",
+        "hwnd": hwnd,
+        "placement_result": int(placement_result),
+        "show_result": int(show_result),
+        "foreground_result": int(foreground_result),
+        "active_result": int(active_result),
+        "focus_result": int(focus_result),
+    }
+
+
+
+def send_input_vk(vk_code: int, *, long_press: bool = False) -> dict:
+    user32 = ctypes.windll.user32
+    scan_code = user32.MapVirtualKeyW(vk_code, 0)
+    extra = ctypes.c_ulong(0)
+
+    key_down = INPUT(
+        type=INPUT_KEYBOARD,
+        union=INPUT_UNION(
+            ki=KEYBDINPUT(
+                wVk=vk_code,
+                wScan=scan_code,
+                dwFlags=0,
+                time=0,
+                dwExtraInfo=ctypes.pointer(extra),
+            )
+        ),
+    )
+    key_up = INPUT(
+        type=INPUT_KEYBOARD,
+        union=INPUT_UNION(
+            ki=KEYBDINPUT(
+                wVk=vk_code,
+                wScan=scan_code,
+                dwFlags=KEYEVENTF_KEYUP,
+                time=0,
+                dwExtraInfo=ctypes.pointer(extra),
+            )
+        ),
+    )
+
+    sent_down = user32.SendInput(1, ctypes.byref(key_down), ctypes.sizeof(INPUT))
+    if long_press:
+        time.sleep(0.3)
+    sent_up = user32.SendInput(1, ctypes.byref(key_up), ctypes.sizeof(INPUT))
+
+    return {
+        "ok": sent_down == 1 and sent_up == 1,
+        "reason": "send_input_ok" if sent_down == 1 and sent_up == 1 else "send_input_failed",
+        "vk_code": vk_code,
+        "scan_code": int(scan_code),
+        "sent_down": int(sent_down),
+        "sent_up": int(sent_up),
+    }
+
+
+
+def inactive_click_window(hwnd: int, position: tuple[int, int], delay: float = 0.05) -> dict:
+    if not hwnd:
+        return {
+            "ok": False,
+            "reason": "invalid_hwnd",
+            "hwnd": hwnd,
+            "position": position,
+        }
+
+    user32 = ctypes.windll.user32
+    if not user32.IsWindow(hwnd):
+        return {
+            "ok": False,
+            "reason": "window_not_found",
+            "hwnd": hwnd,
+            "position": position,
+        }
+
+    x, y = position
+    lparam = _make_lparam(x, y)
+
+    down_result = user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+    time.sleep(delay)
+    up_result = user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
+
+    if not down_result or not up_result:
+        return {
+            "ok": False,
+            "reason": "post_message_failed",
+            "hwnd": hwnd,
+            "position": position,
+            "down_result": int(down_result),
+            "up_result": int(up_result),
+        }
+
+    return {
+        "ok": True,
+        "reason": "posted",
+        "hwnd": hwnd,
+        "position": position,
+        "down_result": int(down_result),
+        "up_result": int(up_result),
+    }
+
+
+
+def inactive_send_key_window(hwnd: int, vk_code: int, *, long_press: bool = False) -> dict:
+    if not hwnd:
+        return {
+            "ok": False,
+            "reason": "invalid_hwnd",
+            "hwnd": hwnd,
+            "vk_code": vk_code,
+        }
+
+    user32 = ctypes.windll.user32
+    if not user32.IsWindow(hwnd):
+        return {
+            "ok": False,
+            "reason": "window_not_found",
+            "hwnd": hwnd,
+            "vk_code": vk_code,
+        }
+
+    scan_code = user32.MapVirtualKeyW(vk_code, 0)
+    is_system_key = vk_code == VK_ESCAPE
+    keydown_msg = WM_SYSKEYDOWN if is_system_key else WM_KEYDOWN
+    keyup_msg = WM_SYSKEYUP if is_system_key else WM_KEYUP
+    keydown_lparam = 1 | (int(scan_code) << 16)
+    keyup_lparam = keydown_lparam | (1 << 30) | (1 << 31)
+    result_value = ctypes.c_size_t()
+    send_flags = 0x0000
+    send_timeout_ms = 200
+
+    down_result = user32.SendMessageTimeoutW(
+        hwnd,
+        keydown_msg,
+        vk_code,
+        keydown_lparam,
+        send_flags,
+        send_timeout_ms,
+        ctypes.byref(result_value),
+    )
+    if long_press:
+        time.sleep(0.3)
+    up_result = user32.SendMessageTimeoutW(
+        hwnd,
+        keyup_msg,
+        vk_code,
+        keyup_lparam,
+        send_flags,
+        send_timeout_ms,
+        ctypes.byref(result_value),
+    )
+
+    fallback_down_result = 0
+    fallback_up_result = 0
+    if not down_result or not up_result:
+        fallback_down_result = user32.PostMessageW(hwnd, keydown_msg, vk_code, keydown_lparam)
+        if long_press:
+            time.sleep(0.3)
+        fallback_up_result = user32.PostMessageW(hwnd, keyup_msg, vk_code, keyup_lparam)
+
+    ok = bool((down_result and up_result) or (fallback_down_result and fallback_up_result))
+    reason = "sent" if ok else "send_message_failed"
+
+    return {
+        "ok": ok,
+        "reason": reason,
+        "hwnd": hwnd,
+        "vk_code": vk_code,
+        "scan_code": int(scan_code),
+        "keydown_msg": int(keydown_msg),
+        "keyup_msg": int(keyup_msg),
+        "down_result": int(down_result),
+        "up_result": int(up_result),
+        "fallback_down_result": int(fallback_down_result),
+        "fallback_up_result": int(fallback_up_result),
+    }
+
+
+def inactive_click_emulator(
+    emulator,
+    position: tuple[int, int],
+    *,
+    prefer_bind_hwnd: bool = True,
+    delay: float = 0.05,
+) -> dict:
+    if prefer_bind_hwnd:
+        hwnd_candidates = _collect_window_handles(getattr(emulator, "bind_hwnd", 0), getattr(emulator, "top_hwnd", 0))
+    else:
+        hwnd_candidates = _collect_window_handles(getattr(emulator, "top_hwnd", 0), getattr(emulator, "bind_hwnd", 0))
+
+    tried: list[dict] = []
+    for hwnd in hwnd_candidates:
+        if not hwnd:
+            continue
+        result = inactive_click_window(hwnd, position, delay=delay)
+        tried.append(result)
+        if result["ok"]:
+            return {
+                "ok": True,
+                "target_hwnd": hwnd,
+                "position": position,
+                "results": tried,
+            }
+
+    return {
+        "ok": False,
+        "reason": "inactive_click_failed",
+        "position": position,
+        "results": tried,
+    }
+
+
+
+def inactive_drag_window(
+    hwnd: int,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    duration: float = 0.2,
+    steps: int = 8,
+) -> dict:
+    if not hwnd:
+        return {
+            "ok": False,
+            "reason": "invalid_hwnd",
+            "hwnd": hwnd,
+            "start": start,
+            "end": end,
+        }
+
+    user32 = ctypes.windll.user32
+    if not user32.IsWindow(hwnd):
+        return {
+            "ok": False,
+            "reason": "window_not_found",
+            "hwnd": hwnd,
+            "start": start,
+            "end": end,
+        }
+
+    sx, sy = start
+    ex, ey = end
+    step_count = max(1, steps)
+    sleep_time = duration / step_count if step_count else duration
+
+    user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, _make_lparam(sx, sy))
+    user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, _make_lparam(sx, sy))
+    for step_index in range(1, step_count + 1):
+        x = int(sx + (ex - sx) * step_index / step_count)
+        y = int(sy + (ey - sy) * step_index / step_count)
+        user32.PostMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON, _make_lparam(x, y))
+        time.sleep(sleep_time)
+    up_result = user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, _make_lparam(ex, ey))
+
+    return {
+        "ok": bool(up_result),
+        "reason": "posted" if up_result else "post_message_failed",
+        "hwnd": hwnd,
+        "start": start,
+        "end": end,
+        "up_result": int(up_result),
+    }
+
+
+
+def inactive_drag_emulator(
+    emulator,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    prefer_bind_hwnd: bool = True,
+    duration: float = 0.2,
+    steps: int = 8,
+) -> dict:
+    if prefer_bind_hwnd:
+        hwnd_candidates = _collect_window_handles(getattr(emulator, "bind_hwnd", 0), getattr(emulator, "top_hwnd", 0))
+    else:
+        hwnd_candidates = _collect_window_handles(getattr(emulator, "top_hwnd", 0), getattr(emulator, "bind_hwnd", 0))
+
+    tried: list[dict] = []
+    for hwnd in hwnd_candidates:
+        if not hwnd:
+            continue
+        result = inactive_drag_window(hwnd, start, end, duration=duration, steps=steps)
+        tried.append(result)
+        if result["ok"]:
+            return {
+                "ok": True,
+                "target_hwnd": hwnd,
+                "start": start,
+                "end": end,
+                "results": tried,
+            }
+
+    return {
+        "ok": False,
+        "reason": "inactive_drag_failed",
+        "start": start,
+        "end": end,
+        "results": tried,
+    }
+
+
+
+def inactive_send_key_emulator(
+    emulator,
+    keycode: int,
+    *,
+    long_press: bool = False,
+    prefer_top_hwnd: bool = True,
+) -> dict:
+    vk_code = ANDROID_TO_WINDOWS_KEY.get(keycode)
+    if vk_code is None:
+        return {
+            "ok": False,
+            "reason": "unsupported_keycode",
+            "keycode": keycode,
+        }
+
+    if prefer_top_hwnd:
+        hwnd_candidates = _collect_window_handles(getattr(emulator, "top_hwnd", 0), getattr(emulator, "bind_hwnd", 0))
+    else:
+        hwnd_candidates = _collect_window_handles(getattr(emulator, "bind_hwnd", 0), getattr(emulator, "top_hwnd", 0))
+
+    tried: list[dict] = []
+    for hwnd in hwnd_candidates:
+        result = inactive_send_key_window(hwnd, vk_code, long_press=long_press)
+        result = {
+            **result,
+            "keycode": keycode,
+        }
+        tried.append(result)
+        if result["ok"]:
+            return {
+                "ok": True,
+                "target_hwnd": hwnd,
+                "keycode": keycode,
+                "vk_code": vk_code,
+                "results": tried,
+            }
+
+    return {
+        "ok": False,
+        "reason": "inactive_key_failed",
+        "keycode": keycode,
+        "vk_code": vk_code,
+        "results": tried,
+    }
+
+
+
+def bind_window_input(emulator):
+    emulator._update()
+
+    def _window_tap(self, *positions):
+        self._error = ""
+        last_result: dict | None = None
+        for position in positions:
+            last_result = inactive_click_emulator(self, position)
+            if not last_result["ok"]:
+                self._error = str(last_result)
+                return self
+        if last_result is not None:
+            self._error = ""
+        return self
+
+    def _window_drag_drop(self, _from, to):
+        result = inactive_drag_emulator(self, _from, to)
+        self._error = "" if result["ok"] else str(result)
+        return self
+
+    def _window_send_event(self, keycode: int, long_press: bool = False):
+        result = inactive_send_key_emulator(self, keycode, long_press=long_press)
+        self._error = "" if result["ok"] else str(result)
+        return self
+
+    emulator.tap = types.MethodType(_window_tap, emulator)
+    emulator.drag_drop = types.MethodType(_window_drag_drop, emulator)
+    emulator.send_event = types.MethodType(_window_send_event, emulator)
+    return emulator
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", BITMAPINFOHEADER),
+        ("bmiColors", wintypes.DWORD * 3),
+    ]
+
+
+
+def capture_window_image(hwnd: int) -> np.ndarray:
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+
+    if not hwnd or not user32.IsWindow(hwnd):
+        raise RuntimeError(f"HWND không hợp lệ: {hwnd}")
+
+    rect = wintypes.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        raise RuntimeError(f"GetClientRect failed for hwnd={hwnd}")
+
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Client rect không hợp lệ cho hwnd={hwnd}: {width}x{height}")
+
+    hwnd_dc = user32.GetDC(hwnd)
+    if not hwnd_dc:
+        raise RuntimeError(f"GetDC failed for hwnd={hwnd}")
+
+    mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+    bitmap = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+    if not mem_dc or not bitmap:
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if mem_dc:
+            gdi32.DeleteDC(mem_dc)
+        user32.ReleaseDC(hwnd, hwnd_dc)
+        raise RuntimeError(f"CreateCompatibleBitmap/DC failed for hwnd={hwnd}")
+
+    old_bitmap = gdi32.SelectObject(mem_dc, bitmap)
+    try:
+        print_result = user32.PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT)
+        if not print_result:
+            bitblt_result = gdi32.BitBlt(mem_dc, 0, 0, width, height, hwnd_dc, 0, 0, SRCCOPY)
+            if not bitblt_result:
+                raise RuntimeError(f"PrintWindow và BitBlt đều failed for hwnd={hwnd}")
+
+        bitmap_info = BITMAPINFO()
+        bitmap_info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bitmap_info.bmiHeader.biWidth = width
+        bitmap_info.bmiHeader.biHeight = -height
+        bitmap_info.bmiHeader.biPlanes = 1
+        bitmap_info.bmiHeader.biBitCount = 32
+        bitmap_info.bmiHeader.biCompression = BI_RGB
+
+        buffer_size = width * height * 4
+        buffer = ctypes.create_string_buffer(buffer_size)
+        rows_copied = gdi32.GetDIBits(
+            mem_dc,
+            bitmap,
+            0,
+            height,
+            buffer,
+            ctypes.byref(bitmap_info),
+            DIB_RGB_COLORS,
+        )
+        if rows_copied != height:
+            raise RuntimeError(f"GetDIBits failed for hwnd={hwnd}: rows={rows_copied}, expected={height}")
+
+        image = np.frombuffer(buffer, dtype=np.uint8).reshape((height, width, 4))
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    finally:
+        gdi32.SelectObject(mem_dc, old_bitmap)
+        gdi32.DeleteObject(bitmap)
+        gdi32.DeleteDC(mem_dc)
+        user32.ReleaseDC(hwnd, hwnd_dc)
+
+
+
+def capture_window_emulator(emulator) -> np.ndarray:
+    emulator._update()
+    last_error: str | None = None
+    for hwnd in (getattr(emulator, "bind_hwnd", 0), getattr(emulator, "top_hwnd", 0)):
+        if not hwnd:
+            continue
+        try:
+            return capture_window_image(hwnd)
+        except Exception as exc:
+            last_error = repr(exc)
+    raise RuntimeError(last_error or f"Không capture được emulator index={getattr(emulator, 'index', '?')}")
+
+
+
+def bind_window_capture(emulator):
+    def _window_screencap(self):
+        try:
+            image = capture_window_emulator(self)
+            success, encoded = cv2.imencode(".png", image)
+            if not success:
+                self._error = "window_capture_encode_failed"
+                return None
+            self._error = ""
+            return encoded.tobytes()
+        except Exception as exc:
+            self._error = repr(exc)
+            return None
+
+    def _window_run_adb(self, cmd: str, decode: str | None = "latin-1"):
+        raise RuntimeError("ADB disabled in window mode")
+
+    def _window_run_app(self, package_name: str):
+        self._error = f"run_app disabled in window mode: {package_name}"
+        return self
+
+    def _window_kill_app(self, package_name: str):
+        self._error = f"kill_app disabled in window mode: {package_name}"
+        return self
+
+    emulator._get_screencap_b64decode = types.MethodType(_window_screencap, emulator)
+    emulator._run_adb = types.MethodType(_window_run_adb, emulator)
+    emulator.run_app = types.MethodType(_window_run_app, emulator)
+    emulator.kill_app = types.MethodType(_window_kill_app, emulator)
+    return emulator
+
+
+
+def bind_window_mode(emulator):
+    bind_window_input(emulator)
+    bind_window_capture(emulator)
+    return emulator
+
+
 class QueueWriter:
     def __init__(self, log_queue: multiprocessing.Queue | None) -> None:
         self.log_queue = log_queue
@@ -128,11 +756,43 @@ def warmup_adb(ld, emulator) -> str:
     return ld._run_cmd(cmd)
 
 
+
 def go_home_by_esc(emulator, keys_module, delay: float = 0.5) -> None:
-    emulator.send_event(keys_module.KEYCODE_ESCAPE)
-    time.sleep(0.3)
-    emulator.send_event(keys_module.KEYCODE_ESCAPE)
-    time.sleep(0.3)
+    adb_cmd = f'{emulator.controller} adb {emulator.this} --command "shell input keyevent {keys_module.KEYCODE_ESCAPE}"'
+    emulator._run_cmd(adb_cmd)
+    time.sleep(delay)
+    emulator._run_cmd(adb_cmd)
+    time.sleep(delay)
+def go_home_by_esc22(emulator, keys_module, delay: float = 0.5) -> None:
+    try:
+        screen = capture_window_emulator(emulator)
+        back_templates = [
+            load_template(BACK1_TEMPLATE),
+            load_template(BACK2_TEMPLATE),
+            load_template(CONFIRM_CHANNEL_TEMPLATE),
+        ]
+
+        best_target: tuple[int, int] | None = None
+        best_score = -1.0
+        for template in back_templates:
+            positions = deduplicate_positions(
+                find_template_positions(screen, template, threshold=0.8),
+                template,
+            )
+            if positions:
+                score = match_score(screen, template)
+                if score > best_score:
+                    best_score = score
+                    best_target = positions[0]
+
+        if best_target is None:
+            return
+        inactive_click_emulator(emulator, best_target)
+        time.sleep(0.3)
+        # inactive_click_emulator(emulator, best_target)
+        # time.sleep(0.3)
+    except Exception:
+        return
 
 
 
@@ -156,8 +816,11 @@ def go_map_5x(emulator, keys_module) -> dict:
     emulator.tap((649, 352))
     time.sleep(1)
     emulator.tap((841, 190))
+
     time.sleep(1)
     emulator.tap((838, 248))
+
+    
     time.sleep(1)
     emulator.tap((974, 634))
     time.sleep(1)
@@ -189,8 +852,12 @@ def dismantle_items(emulator, keys_module) -> dict:
     time.sleep(1)
     emulator.tap((753, 536))
     time.sleep(5)
+    emulator.tap((910, 693))
+    time.sleep(2)
+    emulator.tap((910, 693))
+    time.sleep(2)
     go_home_by_esc(emulator, keys_module)
-    go_home_by_esc(emulator, keys_module)
+    time.sleep(1)
     go_home_by_esc(emulator, keys_module)
     time.sleep(1)
 
@@ -213,11 +880,11 @@ def go_to_boss(emulator, boss_number: int) -> None:
         raise ValueError(f"boss_number không hợp lệ: {boss_number}")
 
     emulator.tap((1253, 35))
-    time.sleep(0.4)
+    time.sleep(1)
     emulator.tap((1134, 620))
-    time.sleep(0.5)
+    time.sleep(2)
     emulator.tap(boss_positions[boss_number])
-    time.sleep(0.3)
+    time.sleep(1)
     emulator.tap((1158, 666))
     time.sleep(1)
     emulator.tap((751, 542))
@@ -235,7 +902,7 @@ def go_to_boss(emulator, boss_number: int) -> None:
 #    - Nếu không còn icon boss nữa thì coi như vào channel thành công.
 #    - Nếu vẫn còn icon boss thì thử ứng viên tiếp theo trong cùng lượt trước khi sang lượt sau.
 # 7. Nếu sau cả 2 lượt vẫn không chọn được thì return skip.
-def select_channel_boss(emulator, boss_number: int, threshold: float = 0.8) -> dict:
+def select_channel_boss(emulator, boss_number: int, threshold: float = 0.7) -> dict:
     debug_steps: list[dict] = []
 
     if boss_number not in BOSS_ICON_TEMPLATES:
@@ -268,14 +935,17 @@ def select_channel_boss(emulator, boss_number: int, threshold: float = 0.8) -> d
         screen_bytes = emulator._get_screencap_b64decode()
         if screen_bytes:
             screen = decode_screen(screen_bytes)
+            channel_score = match_score(screen, channel_template)
             channel_positions = deduplicate_positions(
-                find_template_positions(screen, channel_template, threshold=0.8),
+                find_template_positions(screen, channel_template, threshold=0.7),
                 channel_template,
             )
             debug_steps.append(
                 {
                     "step": "open_channel_panel",
                     "attempt": 1,
+                    "channel_score": channel_score,
+                    "channel_threshold": 0.7,
                     "channel_positions": channel_positions,
                     "channel_positions_count": len(channel_positions),
                 }
@@ -322,6 +992,7 @@ def select_channel_boss(emulator, boss_number: int, threshold: float = 0.8) -> d
             }
 
         screen = decode_screen(screen_bytes)
+        boss_score = match_score(screen, template)
         positions = deduplicate_positions(
             find_template_positions(screen, template, threshold=threshold),
             template,
@@ -329,6 +1000,8 @@ def select_channel_boss(emulator, boss_number: int, threshold: float = 0.8) -> d
         debug_steps.append(
             {
                 "step": scroll_name,
+                "score": boss_score,
+                "threshold": threshold,
                 "positions": positions,
                 "positions_count": len(positions),
                 "first_scroll_single_icon": first_scroll_single_icon,
@@ -602,12 +1275,20 @@ def enable_auto(emulator, enabled: bool) -> dict:
     for verification_index in range(5):
         time.sleep(1)
         verification = detect_auto_state(emulator)
+        verification["verification_index"] = verification_index
+        verification["toggle_attempts_before"] = detection["toggle_attempts"]
         detection["verification_history"].append(verification)
         last_verification = verification
-        if verification["state"] != target_state and detection["toggle_attempts"] == 0:
+
+        if detection["toggle_attempts"] < 3 and verification["state"] != target_state:
             emulator.tap((1226, 514))
-            detection["action"] = "toggled_auto_button"
-            detection["toggle_attempts"] = 1
+            detection["action"] = "toggled_auto_button_retry"
+            detection["toggle_attempts"] += 1
+            verification["retoggled"] = True
+            verification["toggle_attempts_after"] = detection["toggle_attempts"]
+        else:
+            verification["retoggled"] = False
+            verification["toggle_attempts_after"] = detection["toggle_attempts"]
 
     detection["verification"] = last_verification
     detection["state"] = last_verification["state"]
@@ -848,6 +1529,7 @@ def active_boss_world(emulator, keys_module) -> list[dict]:
         else:
             append_boss_log(f"boss={boss_number} | step=use_preloaded_loading | result={loading_result!r}")
 
+        time.sleep(2)
         select_result = select_channel_boss(emulator, boss_number)
         append_boss_log(f"boss={boss_number} | step=select_channel_boss | result={select_result!r}")
         if (not select_result.get("success", False)) or (not select_result.get("clicked", False)):
@@ -903,6 +1585,7 @@ def active_boss_world(emulator, keys_module) -> list[dict]:
         boss_done_result = wait_boss_done(emulator, timeout=boss_timeouts[boss_number])
         append_boss_log(f"boss={boss_number} | step=wait_boss_done | result={boss_done_result!r}")
         recover_result = recover_to_neutral_state()
+      
         append_boss_log(f"boss={boss_number} | step=recover_after_boss_done | result={recover_result!r}")
         status = "completed" if auto_result.get("verified", False) else "completed_with_auto_unverified"
         result = {
@@ -926,21 +1609,24 @@ def active_boss_world(emulator, keys_module) -> list[dict]:
         2: 60,
         3: 2 * 60,
         4: 3 * 60,
-        5: 5 * 60,
-        5: 7 * 60,
+        5: 10 * 60,
+        6: 15 * 60,
     }
 
     print("Go BOSS 2")
     append_boss_log("step=prepare_boss_2 | action=go_to_boss_2")
     go_to_boss(emulator, 2)
+
     first_loading_result = wait_loading(emulator)
+   
     append_boss_log(f"step=prepare_boss_2 | wait_loading={first_loading_result!r}")
     first_auto_result = enable_auto(emulator, False)
     append_boss_log(f"step=prepare_boss_2 | disable_auto={first_auto_result!r}")
     wait_result = wait_boss_start_time()
     append_boss_log(f"step=prepare_boss_2 | wait_boss_start_time={wait_result!r}")
+
     time.sleep(7)
-    append_boss_log("step=prepare_boss_2 | post_wait_sleep=3s")
+    append_boss_log("step=prepare_boss_2 | post_wait_sleep=7s")
     prepare_result = {
         "step": "prepare_boss_2",
         "loading": first_loading_result,
@@ -960,7 +1646,7 @@ def active_boss_world(emulator, keys_module) -> list[dict]:
 
 
 def should_run_boss_world(now: datetime) -> bool:
-    return (now.hour, now.minute) in {(9, 59), (14, 59), (18, 59), (21, 59), (0, 59)}
+    return (now.hour, now.minute) in {(9, 58), (14, 58), (18, 58), (21, 58), (0, 58)}
 
 
 def infinite_farm_loop(emulator, keys_module, loop_interval: float = 10.0) -> None:
@@ -968,33 +1654,42 @@ def infinite_farm_loop(emulator, keys_module, loop_interval: float = 10.0) -> No
     last_boss_trigger: str | None = None
 
     while True:
-        go_home_by_esc(emulator, keys_module)
-        now = datetime.now()
-        trigger_key = now.strftime("%Y-%m-%d %H:%M")
+        try:
+            go_home_by_esc(emulator, keys_module)
+            now = datetime.now()
+            trigger_key = now.strftime("%Y-%m-%d %H:%M")
 
-        if should_run_boss_world(now) and last_boss_trigger != trigger_key:
-            print(f"Run boss world at {trigger_key}")
-            active_boss_world(emulator, keys_module)
-            last_boss_trigger = trigger_key
-            go_map_5x(emulator, keys_module)
-            last_dismantle_at = time.time()
+            if should_run_boss_world(now) and last_boss_trigger != trigger_key:
+                print(f"Run boss world at {trigger_key}")
+                active_boss_world(emulator, keys_module)
+                last_boss_trigger = trigger_key
+                go_map_5x(emulator, keys_module)
+                last_dismantle_at = time.time()
+                time.sleep(loop_interval)
+                continue
+
+            auto_state = detect_auto_state(emulator)
+            print(f"Auto state: {auto_state['state']}")
+
+            if auto_state["state"] != "auto":
+                print("Auto is off, go to map 5x")
+                go_map_5x(emulator, keys_module)
+
+            now_ts = time.time()
+            if now_ts - last_dismantle_at >= 20 * 60:
+                print("Run dismantle items")
+                dismantle_items(emulator, keys_module)
+                last_dismantle_at = now_ts
+
             time.sleep(loop_interval)
-            continue
-
-        auto_state = detect_auto_state(emulator)
-        print(f"Auto state: {auto_state['state']}")
-
-        if auto_state["state"] != "auto":
-            print("Auto is off, go to map 5x")
-            go_map_5x(emulator, keys_module)
-
-        now_ts = time.time()
-        if now_ts - last_dismantle_at >= 20 * 60:
-            print("Run dismantle items")
-            dismantle_items(emulator, keys_module)
-            last_dismantle_at = now_ts
-
-        time.sleep(loop_interval)
+        except Exception as exc:
+            print(f"Farm loop recovered from error: {exc!r}")
+            print(traceback.format_exc())
+            try:
+                go_home_by_esc(emulator, keys_module)
+            except Exception as recover_exc:
+                print(f"Farm loop recovery failed: {recover_exc!r}")
+            time.sleep(3)
 
 
 def active_fever(emulator, check_interval: float = 10.0, threshold: float = 0.8) -> None:
@@ -1013,14 +1708,25 @@ def active_fever(emulator, check_interval: float = 10.0, threshold: float = 0.8)
         time.sleep(check_interval)
 
 
+def run_emulator_adb_command(emulator, command: str) -> str:
+    adb_cmd = f'{emulator.controller} adb {emulator.this} --command "{command}"'
+    return emulator._run_cmd(adb_cmd)
+
+
 def active_login(emulator, keys_module, threshold: float = 0.6) -> dict:
     login_template = load_template(LOGIN_TEMPLATE)
     startgame_template = load_template(STARTGAME_TEMPLATE)
     package_name = "com.playwith.sealm.g.googl"
 
-    emulator.kill_app(package_name)
+    try:
+        run_emulator_adb_command(emulator, f"shell am force-stop {package_name}")
+    except Exception as exc:
+        print(f"Login force-stop failed for {package_name}: {exc}")
     time.sleep(5)
-    emulator.run_app(package_name)
+    try:
+        run_emulator_adb_command(emulator, f"shell monkey -p {package_name} -c android.intent.category.LAUNCHER 1")
+    except Exception as exc:
+        print(f"Login launch failed for {package_name}: {exc}")
 
     while True:
         screen_bytes = emulator._get_screencap_b64decode()
@@ -1035,15 +1741,19 @@ def active_login(emulator, keys_module, threshold: float = 0.6) -> dict:
         time.sleep(0.5)
 
     go_home_by_esc(emulator, keys_module)
-    emulator.tap((656, 592))
-    emulator.tap((406, 575))
-    time.sleep(1)
-    emulator.tap((653, 310))
-    time.sleep(10)
-    time.sleep(1)
-    emulator.tap((395, 355))
-    time.sleep(1)
-    emulator.tap((871, 214))
+    # emulator.tap((656, 592))
+    # emulator.tap((656, 592))
+    # emulator.tap((406, 575))
+    emulator.tap((656, 200))
+    emulator.tap((656, 200))
+    time.sleep(2)
+    emulator.tap((656, 200))
+    # emulator.tap((653, 310))
+    # time.sleep(10)
+    # time.sleep(1)
+    # emulator.tap((395, 355))
+    # time.sleep(1)
+    # emulator.tap((871, 214))
 
     while True:
         screen_bytes = emulator._get_screencap_b64decode()
@@ -1075,12 +1785,12 @@ def active_detect_disconnect(emulator, keys_module, check_interval: float = 10 *
         window_output = ""
 
         try:
-            activity_output = emulator._run_adb("shell dumpsys activity activities")
+            activity_output = run_emulator_adb_command(emulator, "shell dumpsys activity activities")
         except Exception as exc:
             print(f"Cannot read activity state for {package_name}: {exc}")
 
         try:
-            window_output = emulator._run_adb("shell dumpsys window windows")
+            window_output = run_emulator_adb_command(emulator, "shell dumpsys window windows")
         except Exception as exc:
             print(f"Cannot read window state for {package_name}: {exc}")
 
@@ -1241,7 +1951,6 @@ def active_dungeon(emulator, keys_module, threshold: float = 0.93) -> dict:
                     emulator.tap((752, 540))
                     time.sleep(5)
                     go_home_by_esc(emulator, keys_module)
-                    go_home_by_esc(emulator, keys_module)
 
                     return {
                         "success": True,
@@ -1324,7 +2033,6 @@ def active_dungeon(emulator, keys_module, threshold: float = 0.93) -> dict:
     ]
 
     go_home_by_esc(emulator, keys_module)
-    go_home_by_esc(emulator, keys_module)
     return {
         "success": all(result.get("success", False) for result in results),
         "results": results,
@@ -1364,6 +2072,7 @@ def run_emulator_worker(emulator_index: int, log_queue: multiprocessing.Queue | 
         ld, cloned_keys = create_ldplayer()
         emulator = ld.emulators[emulator_index]
         emulator.start(wait=True)
+        bind_window_mode(emulator)
         print(
             f"Selected emulator: index={emulator.index}, "
             f"name={emulator.name}, top_hwnd={emulator.top_hwnd}, bind_hwnd={emulator.bind_hwnd}"
@@ -1386,6 +2095,7 @@ def run_boss_worker(emulator_index: int, log_queue: multiprocessing.Queue | None
         ld, cloned_keys = create_ldplayer()
         emulator = ld.emulators[emulator_index]
         emulator.start(wait=True)
+        bind_window_mode(emulator)
         print(
             f"Selected emulator for boss: index={emulator.index}, "
             f"name={emulator.name}, top_hwnd={emulator.top_hwnd}, bind_hwnd={emulator.bind_hwnd}"
@@ -1408,6 +2118,7 @@ def run_quest_worker(emulator_index: int, log_queue: multiprocessing.Queue | Non
         ld, cloned_keys = create_ldplayer()
         emulator = ld.emulators[emulator_index]
         emulator.start(wait=True)
+        bind_window_mode(emulator)
         print(
             f"Selected emulator for quest: index={emulator.index}, "
             f"name={emulator.name}, top_hwnd={emulator.top_hwnd}, bind_hwnd={emulator.bind_hwnd}"
@@ -1430,6 +2141,7 @@ def run_dismantle_worker(emulator_index: int, log_queue: multiprocessing.Queue |
         ld, cloned_keys = create_ldplayer()
         emulator = ld.emulators[emulator_index]
         emulator.start(wait=True)
+        bind_window_mode(emulator)
         print(
             f"Selected emulator for dismantle: index={emulator.index}, "
             f"name={emulator.name}, top_hwnd={emulator.top_hwnd}, bind_hwnd={emulator.bind_hwnd}"
@@ -1438,16 +2150,7 @@ def run_dismantle_worker(emulator_index: int, log_queue: multiprocessing.Queue |
         print(f"ADB warmup dismantle: {adb_state!r}")
         while True:
             go_home_by_esc(emulator, cloned_keys)
-            go_home_by_esc(emulator, cloned_keys)
-            go_home_by_esc(emulator, cloned_keys)
-            go_home_by_esc(emulator, cloned_keys)
-            go_home_by_esc(emulator, cloned_keys)
-            go_home_by_esc(emulator, cloned_keys)
             result = dismantle_items(emulator, cloned_keys)
-            go_home_by_esc(emulator, cloned_keys)
-            go_home_by_esc(emulator, cloned_keys)
-            go_home_by_esc(emulator, cloned_keys)
-            go_home_by_esc(emulator, cloned_keys)
             go_home_by_esc(emulator, cloned_keys)
             print(f"Dismantle result: {result!r}")
             time.sleep(interval_seconds)
@@ -1466,6 +2169,7 @@ def run_dungeon_worker(emulator_index: int, log_queue: multiprocessing.Queue | N
         ld, cloned_keys = create_ldplayer()
         emulator = ld.emulators[emulator_index]
         emulator.start(wait=True)
+        bind_window_mode(emulator)
         print(
             f"Selected emulator for dungeon: index={emulator.index}, "
             f"name={emulator.name}, top_hwnd={emulator.top_hwnd}, bind_hwnd={emulator.bind_hwnd}"
@@ -1492,6 +2196,7 @@ def run_fever_worker(emulator_index: int, log_queue: multiprocessing.Queue | Non
         ld, _ = create_ldplayer()
         emulator = ld.emulators[emulator_index]
         emulator.start(wait=True)
+        bind_window_mode(emulator)
         print(
             f"Selected emulator for fever: index={emulator.index}, "
             f"name={emulator.name}, top_hwnd={emulator.top_hwnd}, bind_hwnd={emulator.bind_hwnd}"
@@ -1514,6 +2219,7 @@ def run_detect_disconnect_worker(emulator_index: int, log_queue: multiprocessing
         ld, cloned_keys = create_ldplayer()
         emulator = ld.emulators[emulator_index]
         emulator.start(wait=True)
+        bind_window_mode(emulator)
         print(
             f"Selected emulator for detect_disconnect: index={emulator.index}, "
             f"name={emulator.name}, top_hwnd={emulator.top_hwnd}, bind_hwnd={emulator.bind_hwnd}"
@@ -1558,6 +2264,7 @@ class LDPlayerManagerApp:
         self.dismantle_button_refs: dict[int, ttk.Button] = {}
         self.fever_button_refs: dict[int, ttk.Button] = {}
         self.detect_disconnect_button_refs: dict[int, ttk.Button] = {}
+        self.test_click_button_refs: dict[int, ttk.Button] = {}
         self.log_button_refs: dict[int, ttk.Button] = {}
         self.rows: dict[int, dict[str, ttk.Label]] = {}
         self.log_windows: dict[int, tk.Toplevel] = {}
@@ -1595,8 +2302,8 @@ class LDPlayerManagerApp:
         self.table = ttk.Frame(container, padding=10, style="Card.TFrame")
         self.table.pack(fill="both", expand=True)
 
-        headers = ["Name", "Status", "Farm", "Boss", "Quest", "Dungeon", "Dismantle", "Faver", "Disconnect", "Log"]
-        widths = [10, 14, 10, 10, 10, 11, 12, 10, 12, 10]
+        headers = ["Name", "Status", "Farm", "Boss", "Quest", "Dungeon", "Dismantle", "Faver", "Disconnect", "TestClick", "Log"]
+        widths = [10, 14, 10, 10, 10, 11, 12, 10, 12, 12, 10]
         for col, (text, width) in enumerate(zip(headers, widths, strict=False)):
             label = ttk.Label(self.table, text=text, anchor="center", style="TableHeader.TLabel")
             label.grid(row=0, column=col, padx=4, pady=(0, 6), sticky="nsew")
@@ -1654,9 +2361,10 @@ class LDPlayerManagerApp:
         dismantle_button = self.dismantle_button_refs.get(emulator_index)
         fever_button = self.fever_button_refs.get(emulator_index)
         detect_disconnect_button = self.detect_disconnect_button_refs.get(emulator_index)
+        test_click_button = self.test_click_button_refs.get(emulator_index)
         log_button = self.log_button_refs.get(emulator_index)
         status_label = self.rows.get(emulator_index, {}).get("status")
-        if button is None or boss_button is None or quest_button is None or dungeon_button is None or dismantle_button is None or fever_button is None or detect_disconnect_button is None or status_label is None or log_button is None:
+        if button is None or boss_button is None or quest_button is None or dungeon_button is None or dismantle_button is None or fever_button is None or detect_disconnect_button is None or test_click_button is None or status_label is None or log_button is None:
             return
 
         if self.is_process_running(emulator_index):
@@ -1696,6 +2404,7 @@ class LDPlayerManagerApp:
 
         fever_button.configure(state="normal")
         detect_disconnect_button.configure(state="normal")
+        test_click_button.configure(state="normal")
         log_button.configure(state="normal")
 
         if self.is_process_running(emulator_index):
@@ -1733,6 +2442,8 @@ class LDPlayerManagerApp:
             button.destroy()
         for button in self.detect_disconnect_button_refs.values():
             button.destroy()
+        for button in self.test_click_button_refs.values():
+            button.destroy()
         for button in self.log_button_refs.values():
             button.destroy()
         self.rows.clear()
@@ -1743,6 +2454,7 @@ class LDPlayerManagerApp:
         self.dismantle_button_refs.clear()
         self.fever_button_refs.clear()
         self.detect_disconnect_button_refs.clear()
+        self.test_click_button_refs.clear()
         self.log_button_refs.clear()
 
     def refresh_emulators(self) -> None:
@@ -1842,13 +2554,21 @@ class LDPlayerManagerApp:
             )
             detect_disconnect_button.grid(row=row_index, column=8, padx=4, pady=4, sticky="nsew")
 
+            test_click_button = ttk.Button(
+                self.table,
+                text="Click",
+                command=lambda idx=emulator_index: self.test_inactive_click(idx),
+                style="Action.TButton",
+            )
+            test_click_button.grid(row=row_index, column=9, padx=4, pady=4, sticky="nsew")
+
             log_button = ttk.Button(
                 self.table,
                 text="Log",
                 command=lambda idx=emulator_index, name=emulator["name"]: self.open_log_window(idx, name),
                 style="Action.TButton",
             )
-            log_button.grid(row=row_index, column=9, padx=4, pady=4, sticky="nsew")
+            log_button.grid(row=row_index, column=10, padx=4, pady=4, sticky="nsew")
 
             self.rows[emulator_index] = labels
             self.button_refs[emulator_index] = button
@@ -1858,6 +2578,7 @@ class LDPlayerManagerApp:
             self.dismantle_button_refs[emulator_index] = dismantle_button
             self.fever_button_refs[emulator_index] = fever_button
             self.detect_disconnect_button_refs[emulator_index] = detect_disconnect_button
+            self.test_click_button_refs[emulator_index] = test_click_button
             self.log_button_refs[emulator_index] = log_button
             self.update_button_state(emulator_index)
 
@@ -1897,6 +2618,26 @@ class LDPlayerManagerApp:
         text.insert("end", message + "\n")
         text.see("end")
         text.configure(state="disabled")
+
+    def test_inactive_click(self, emulator_index: int) -> None:
+        try:
+            ld, cloned_keys = create_ldplayer()
+            emulator = ld.emulators[emulator_index]
+            bind_window_mode(emulator)
+            emulator._update()
+            click_result = inactive_click_emulator(emulator, (1193, 213))
+            time.sleep(2)
+            go_home_by_esc(emulator, cloned_keys)
+            combined_result = {
+                "click": click_result,
+                "esc": "go_home_by_esc_adb",
+            }
+            self.message_var.set(f"Test click {emulator.name}: {combined_result!r}")
+            self.append_log(emulator_index, f"Test inactive click (1193, 213) + esc: {combined_result!r}")
+        except Exception as exc:
+            message = f"Test click failed for emulator {emulator_index}: {exc!r}"
+            self.message_var.set(message)
+            self.append_log(emulator_index, message)
 
     def start_emulator(self, emulator_index: int) -> None:
         if self.is_process_running(emulator_index):
@@ -2181,15 +2922,20 @@ class LDPlayerManagerApp:
                     self.stop_dismantle(emulator_index)
                     self.stop_fever(emulator_index)
                     self.detect_disconnect_processes.pop(emulator_index, None)
+                    self.message_var.set("Đã phát hiện disconnect, đang login lại")
                     self.update_button_state(emulator_index)
-                    self.start_detect_disconnect(emulator_index)
                     continue
 
                 if message == "__START_RUN_AFTER_LOGIN__":
+                    existing_detect_process = self.detect_disconnect_processes.get(emulator_index)
+                    if existing_detect_process is not None and existing_detect_process.is_alive():
+                        existing_detect_process.kill()
+                        existing_detect_process.join(timeout=1)
                     self.detect_disconnect_processes.pop(emulator_index, None)
                     self.update_button_state(emulator_index)
                     self.start_emulator(emulator_index)
-                    self.start_detect_disconnect(emulator_index)
+                    self.message_var.set("Login lại thành công, đang chạy lại infinity farm")
+                    self.root.after(5000, lambda idx=emulator_index: self.start_detect_disconnect(idx))
                     continue
 
                 if emulator_index in self.log_texts:

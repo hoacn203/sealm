@@ -7,6 +7,7 @@ import sys
 import time
 import types
 import tkinter as tk
+import ctypes
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -98,6 +99,95 @@ def create_ldplayer():
     cloned_emulator, cloned_keys = load_runtime_modules()
     ld = cloned_emulator.LDPlayer(ldplayer_dir=LDPLAYER_DIR)
     return ld, cloned_keys
+
+
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+MK_LBUTTON = 0x0001
+
+
+def _make_lparam(x: int, y: int) -> int:
+    return ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+
+
+def inactive_click_window(hwnd: int, position: tuple[int, int], delay: float = 0.05) -> dict:
+    if not hwnd:
+        return {
+            "ok": False,
+            "reason": "invalid_hwnd",
+            "hwnd": hwnd,
+            "position": position,
+        }
+
+    user32 = ctypes.windll.user32
+    if not user32.IsWindow(hwnd):
+        return {
+            "ok": False,
+            "reason": "window_not_found",
+            "hwnd": hwnd,
+            "position": position,
+        }
+
+    x, y = position
+    lparam = _make_lparam(x, y)
+
+    down_result = user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+    time.sleep(delay)
+    up_result = user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
+
+    if not down_result or not up_result:
+        return {
+            "ok": False,
+            "reason": "post_message_failed",
+            "hwnd": hwnd,
+            "position": position,
+            "down_result": int(down_result),
+            "up_result": int(up_result),
+        }
+
+    return {
+        "ok": True,
+        "reason": "posted",
+        "hwnd": hwnd,
+        "position": position,
+        "down_result": int(down_result),
+        "up_result": int(up_result),
+    }
+
+
+def inactive_click_emulator(
+    emulator,
+    position: tuple[int, int],
+    *,
+    prefer_bind_hwnd: bool = True,
+    delay: float = 0.05,
+) -> dict:
+    hwnd_candidates = []
+    if prefer_bind_hwnd:
+        hwnd_candidates.extend([getattr(emulator, "bind_hwnd", 0), getattr(emulator, "top_hwnd", 0)])
+    else:
+        hwnd_candidates.extend([getattr(emulator, "top_hwnd", 0), getattr(emulator, "bind_hwnd", 0)])
+
+    tried: list[dict] = []
+    for hwnd in hwnd_candidates:
+        if not hwnd:
+            continue
+        result = inactive_click_window(hwnd, position, delay=delay)
+        tried.append(result)
+        if result["ok"]:
+            return {
+                "ok": True,
+                "target_hwnd": hwnd,
+                "position": position,
+                "results": tried,
+            }
+
+    return {
+        "ok": False,
+        "reason": "inactive_click_failed",
+        "position": position,
+        "results": tried,
+    }
 
 
 class QueueWriter:
@@ -927,7 +1017,7 @@ def active_boss_world(emulator, keys_module) -> list[dict]:
         3: 2 * 60,
         4: 3 * 60,
         5: 5 * 60,
-        6: 7 * 60,
+        5: 7 * 60,
     }
 
     print("Go BOSS 2")
@@ -1558,6 +1648,7 @@ class LDPlayerManagerApp:
         self.dismantle_button_refs: dict[int, ttk.Button] = {}
         self.fever_button_refs: dict[int, ttk.Button] = {}
         self.detect_disconnect_button_refs: dict[int, ttk.Button] = {}
+        self.test_click_button_refs: dict[int, ttk.Button] = {}
         self.log_button_refs: dict[int, ttk.Button] = {}
         self.rows: dict[int, dict[str, ttk.Label]] = {}
         self.log_windows: dict[int, tk.Toplevel] = {}
@@ -1595,8 +1686,8 @@ class LDPlayerManagerApp:
         self.table = ttk.Frame(container, padding=10, style="Card.TFrame")
         self.table.pack(fill="both", expand=True)
 
-        headers = ["Name", "Status", "Farm", "Boss", "Quest", "Dungeon", "Dismantle", "Faver", "Disconnect", "Log"]
-        widths = [10, 14, 10, 10, 10, 11, 12, 10, 12, 10]
+        headers = ["Name", "Status", "Farm", "Boss", "Quest", "Dungeon", "Dismantle", "Faver", "Disconnect", "TestClick", "Log"]
+        widths = [10, 14, 10, 10, 10, 11, 12, 10, 12, 12, 10]
         for col, (text, width) in enumerate(zip(headers, widths, strict=False)):
             label = ttk.Label(self.table, text=text, anchor="center", style="TableHeader.TLabel")
             label.grid(row=0, column=col, padx=4, pady=(0, 6), sticky="nsew")
@@ -1654,9 +1745,10 @@ class LDPlayerManagerApp:
         dismantle_button = self.dismantle_button_refs.get(emulator_index)
         fever_button = self.fever_button_refs.get(emulator_index)
         detect_disconnect_button = self.detect_disconnect_button_refs.get(emulator_index)
+        test_click_button = self.test_click_button_refs.get(emulator_index)
         log_button = self.log_button_refs.get(emulator_index)
         status_label = self.rows.get(emulator_index, {}).get("status")
-        if button is None or boss_button is None or quest_button is None or dungeon_button is None or dismantle_button is None or fever_button is None or detect_disconnect_button is None or status_label is None or log_button is None:
+        if button is None or boss_button is None or quest_button is None or dungeon_button is None or dismantle_button is None or fever_button is None or detect_disconnect_button is None or test_click_button is None or status_label is None or log_button is None:
             return
 
         if self.is_process_running(emulator_index):
@@ -1696,6 +1788,7 @@ class LDPlayerManagerApp:
 
         fever_button.configure(state="normal")
         detect_disconnect_button.configure(state="normal")
+        test_click_button.configure(state="normal")
         log_button.configure(state="normal")
 
         if self.is_process_running(emulator_index):
@@ -1733,6 +1826,8 @@ class LDPlayerManagerApp:
             button.destroy()
         for button in self.detect_disconnect_button_refs.values():
             button.destroy()
+        for button in self.test_click_button_refs.values():
+            button.destroy()
         for button in self.log_button_refs.values():
             button.destroy()
         self.rows.clear()
@@ -1743,6 +1838,7 @@ class LDPlayerManagerApp:
         self.dismantle_button_refs.clear()
         self.fever_button_refs.clear()
         self.detect_disconnect_button_refs.clear()
+        self.test_click_button_refs.clear()
         self.log_button_refs.clear()
 
     def refresh_emulators(self) -> None:
@@ -1842,13 +1938,21 @@ class LDPlayerManagerApp:
             )
             detect_disconnect_button.grid(row=row_index, column=8, padx=4, pady=4, sticky="nsew")
 
+            test_click_button = ttk.Button(
+                self.table,
+                text="Click",
+                command=lambda idx=emulator_index: self.test_inactive_click(idx),
+                style="Action.TButton",
+            )
+            test_click_button.grid(row=row_index, column=9, padx=4, pady=4, sticky="nsew")
+
             log_button = ttk.Button(
                 self.table,
                 text="Log",
                 command=lambda idx=emulator_index, name=emulator["name"]: self.open_log_window(idx, name),
                 style="Action.TButton",
             )
-            log_button.grid(row=row_index, column=9, padx=4, pady=4, sticky="nsew")
+            log_button.grid(row=row_index, column=10, padx=4, pady=4, sticky="nsew")
 
             self.rows[emulator_index] = labels
             self.button_refs[emulator_index] = button
@@ -1858,6 +1962,7 @@ class LDPlayerManagerApp:
             self.dismantle_button_refs[emulator_index] = dismantle_button
             self.fever_button_refs[emulator_index] = fever_button
             self.detect_disconnect_button_refs[emulator_index] = detect_disconnect_button
+            self.test_click_button_refs[emulator_index] = test_click_button
             self.log_button_refs[emulator_index] = log_button
             self.update_button_state(emulator_index)
 
@@ -1897,6 +2002,19 @@ class LDPlayerManagerApp:
         text.insert("end", message + "\n")
         text.see("end")
         text.configure(state="disabled")
+
+    def test_inactive_click(self, emulator_index: int) -> None:
+        try:
+            ld, _ = create_ldplayer()
+            emulator = ld.emulators[emulator_index]
+            emulator._update()
+            result = inactive_click_emulator(emulator, (1193, 213))
+            self.message_var.set(f"Test click {emulator.name}: {result!r}")
+            self.append_log(emulator_index, f"Test inactive click (1193, 213): {result!r}")
+        except Exception as exc:
+            message = f"Test click failed for emulator {emulator_index}: {exc!r}"
+            self.message_var.set(message)
+            self.append_log(emulator_index, message)
 
     def start_emulator(self, emulator_index: int) -> None:
         if self.is_process_running(emulator_index):
